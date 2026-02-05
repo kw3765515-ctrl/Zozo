@@ -8,21 +8,22 @@ const crypto = require('crypto');
 const axios = require('axios');
 
 const app = express();
-const PORT = 3000;
+const PORT = 3001;
 const BOTS_DIR = path.join(__dirname, 'bots_data');
 const API_BASE = 'https://jzuwisudu.netlify.app/api/keyfb';
-const ADMIN_PHONE = '0825658423'; // เบอร์รับเงิน
-const MIN_AMOUNT = 10; // ขั้นต่ำ 10 บาท
-const TOKEN_PRICE = 1; // 1 บาทต่อ 1 โทเค่น = 1 ชั่วโมง
-
-// Encryption Key
+const ADMIN_PHONE = '0825658423';
+const MIN_AMOUNT = 10;
+const TOKEN_PRICE = 1;
 const ENC_KEY = 'AutoRedbagV3SecretKey2024!@#$%^&*()';
+
+let activeBots = new Map();
+const activeApis = new Map();
+const botIntervals = new Map(); // เก็บ intervals ของแต่ละ bot
 
 if (!fs.existsSync(BOTS_DIR)) {
   fs.mkdirSync(BOTS_DIR);
 }
 
-// IP Tracking
 const ipDataFile = path.join(__dirname, 'ip.json');
 function logIP(ip, action) {
   let data = {};
@@ -38,7 +39,6 @@ function logIP(ip, action) {
   fs.writeFileSync(ipDataFile, JSON.stringify(data, null, 2));
 }
 
-// Purchase History
 const purchaseHistoryFile = path.join(__dirname, 'purchase_history.json');
 function savePurchase(purchase) {
   let history = [];
@@ -56,7 +56,6 @@ function savePurchase(purchase) {
 
 app.use(express.json());
 
-// ==================== ENCRYPTION UTILS ====================
 function xorEncrypt(text, key) {
   let result = '';
   for (let i = 0; i < text.length; i++) {
@@ -146,19 +145,18 @@ function sendEncrypted(res, data) {
   }
 }
 
-// ==================== KEY GENERATION ====================
 function generateRandomKey() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   const segment1 = Array.from({length: 4}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
   const segment2 = Array.from({length: 8}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  return `KEYF-${segment1}-${segment2}`;
+  return 'KEYF-' + segment1 + '-' + segment2;
 }
 
 async function createNewKeyInDB(tokens = 100) {
   try {
     const newKeyString = generateRandomKey();
     const timestamp = Date.now();
-    const pathId = `key_${timestamp}`;
+    const pathId = 'key_' + timestamp;
 
     const payload = {
       key: newKeyString,
@@ -170,7 +168,7 @@ async function createNewKeyInDB(tokens = 100) {
     };
 
     const response = await axios.put(
-      `https://fgddf-a6f13-default-rtdb.firebaseio.com/standalone_keys/${pathId}.json`,
+      'https://fgddf-a6f13-default-rtdb.firebaseio.com/standalone_keys/' + pathId + '.json',
       payload,
       {
         headers: {
@@ -187,16 +185,23 @@ async function createNewKeyInDB(tokens = 100) {
   }
 }
 
-// ==================== ORIGINAL FUNCTIONS ====================
 function getBotFilePath(botId) {
-  return path.join(BOTS_DIR, `${botId}.json`);
+  return path.join(BOTS_DIR, botId + '.json');
 }
 
 function saveBotData(bot) {
+  // ตรวจสอบว่า bot ยังมีอยู่ใน activeBots ก่อน save
+  if (!activeBots.has(bot.id)) return;
   fs.writeFileSync(getBotFilePath(bot.id), JSON.stringify(bot, null, 2));
 }
 
 function deleteBotData(botId) {
+  // Clear all intervals for this bot
+  if (botIntervals.has(botId)) {
+    const intervals = botIntervals.get(botId);
+    intervals.forEach(intervalId => clearInterval(intervalId));
+    botIntervals.delete(botId);
+  }
   const filePath = getBotFilePath(botId);
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   activeBots.delete(botId);
@@ -218,7 +223,7 @@ function loadAllBots() {
 
 async function checkKeyCredit(key) {
   try {
-    const res = await fetch(`${API_BASE}/credit?key=${encodeURIComponent(key)}`);
+    const res = await fetch(API_BASE + '/credit?key=' + encodeURIComponent(key));
     return await res.json();
   } catch (e) {
     return { ok: false, error: 'NETWORK_ERROR' };
@@ -227,7 +232,7 @@ async function checkKeyCredit(key) {
 
 async function deductTokens(key, amount) {
   try {
-    const res = await fetch(`${API_BASE}/use`, {
+    const res = await fetch(API_BASE + '/use', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key, tokens: amount })
@@ -239,14 +244,12 @@ async function deductTokens(key, amount) {
   }
 }
 
-// Extract TrueWallet voucher code from message (silent mode)
 function extractVoucherCode(text) {
   const pattern = /https?:\/\/gift\.truemoney\.com\/campaign\/[^?]*\?v=([a-zA-Z0-9]+)/i;
   const match = text.match(pattern);
   return match ? match[1] : null;
 }
 
-// Redeem TrueWallet voucher (silent mode)
 async function redeemVoucher(code, phone) {
   try {
     const result = await twApi(code, phone);
@@ -260,7 +263,6 @@ async function redeemVoucher(code, phone) {
   }
 }
 
-// Token Deduct System - ทำงานทุกนาที
 setInterval(async () => {
   for (const [botId, bot] of activeBots) {
     if (bot.status === 'online') {
@@ -268,12 +270,9 @@ setInterval(async () => {
       const lastDeductMs = bot.lastDeductTime ? new Date(bot.lastDeductTime).getTime() : now;
       const oneHour = 60 * 60 * 1000;
       
-      // ตรวจสอบว่าครบ 1 ชั่วโมงหรือยัง (เช็คจากเวลาที่หักล่าสุดจริงๆ)
       if (now - lastDeductMs >= oneHour) {
         const success = await deductTokens(bot.key, 1);
         if (success) {
-          // อัพเดท lastDeductTime โดยเพิ่มไป 1 ชั่วโมงจากเวลาเดิม (ไม่ใช่เวลาปัจจุบัน)
-          // เพื่อให้เวลาเดินอย่างต่อเนื่องแม้บอทจะรีสตาร์ท
           const newDeductTime = new Date(lastDeductMs + oneHour);
           bot.lastDeductTime = newDeductTime.toISOString();
           saveBotData(bot);
@@ -285,15 +284,16 @@ setInterval(async () => {
   }
 }, 60000);
 
-let activeBots = new Map();
-const activeApis = new Map();
-
 async function startBot(bot) {
-  let credentials;
+  // ws3-fca expects appState as an Array of cookie objects
+  let appState;
   try {
-    credentials = { appState: JSON.parse(bot.appStateStr) };
+    appState = JSON.parse(bot.appStateStr);
+    if (!Array.isArray(appState)) {
+      throw new Error('appState is not an array');
+    }
   } catch (e) {
-    console.error(`[Bot ${bot.id}] Invalid appState:`, e);
+    console.error('[Bot ' + bot.id + '] Invalid appState format:', e.message);
     deleteBotData(bot.id);
     return;
   }
@@ -301,7 +301,7 @@ async function startBot(bot) {
   bot.status = 'connecting';
   saveBotData(bot);
   
-  login(credentials, {
+  login(appState, {
     online: true,
     updatePresence: true,
     selfListen: false,
@@ -309,32 +309,31 @@ async function startBot(bot) {
     logLevel: 'silent'
   }, async (err, api) => {
     if (err) {
-      console.error(`[Bot ${bot.id}] Login failed:`, err);
-      deleteBotData(bot.id);
+      console.error('[Bot ' + bot.id + '] Login failed:', err.message || err);
+      bot.status = 'error';
+      saveBotData(bot);
       return;
     }
 
     const uID = api.getCurrentUserID();
     if (!uID) {
-      console.error(`[Bot ${bot.id}] Cannot get UID`);
+      console.error('[Bot ' + bot.id + '] Cannot get UID');
       deleteBotData(bot.id);
       return;
     }
     
-    console.log(`[Bot ${bot.id}] ✅ Login success, UID: ${uID}`);
+    console.log('[Bot ' + bot.id + '] Login success, UID: ' + uID);
     
     activeApis.set(bot.id, api);
     bot.userID = uID;
     bot.status = 'online';
-    bot.name = `FB User ${uID}`;
+    bot.name = 'FB User ' + uID;
     
-    // คำนวณ token ที่ควรหักระหว่างที่บอทปิด
     const now = Date.now();
     const lastDeductMs = bot.lastDeductTime ? new Date(bot.lastDeductTime).getTime() : now;
     const hoursPassed = Math.floor((now - lastDeductMs) / (60 * 60 * 1000));
     
     if (hoursPassed > 0) {
-      // หัก token ที่ค้างไว้ตอนบอทปิด
       for (let i = 0; i < hoursPassed; i++) {
         const success = await deductTokens(bot.key, 1);
         if (!success) {
@@ -344,13 +343,16 @@ async function startBot(bot) {
       }
       bot.lastDeductTime = new Date(lastDeductMs + (hoursPassed * 60 * 60 * 1000)).toISOString();
     } else {
-      // ถ้ายังไม่ถึง 1 ชั่วโมง ให้ใช้เวลาเดิม หรือถ้าไม่มีให้ตั้งเป็นเวลาปัจจุบัน
       if (!bot.lastDeductTime) {
         bot.lastDeductTime = new Date().toISOString();
       }
     }
     
     saveBotData(bot);
+    
+    // เก็บ intervals ของ bot นี้
+    const intervals = [];
+    botIntervals.set(bot.id, intervals);
     
     setTimeout(() => {
       let attempts = 0;
@@ -361,7 +363,12 @@ async function startBot(bot) {
         try {
           api.getUserInfo([uID], (err, ret) => {
             if (err) {
-              if (attempts >= maxAttempts) clearInterval(fetchNameInterval);
+              console.log('[Bot ' + bot.id + '] getUserInfo error:', err.message || err);
+              if (attempts >= maxAttempts) {
+                clearInterval(fetchNameInterval);
+                const ints = botIntervals.get(bot.id) || [];
+                botIntervals.set(bot.id, ints.filter(i => i !== fetchNameInterval));
+              }
               return;
             }
             
@@ -377,14 +384,26 @@ async function startBot(bot) {
               bot.name = userData.name;
               saveBotData(bot);
               clearInterval(fetchNameInterval);
+              const ints = botIntervals.get(bot.id) || [];
+              botIntervals.set(bot.id, ints.filter(i => i !== fetchNameInterval));
             } else {
-              if (attempts >= maxAttempts) clearInterval(fetchNameInterval);
+              if (attempts >= maxAttempts) {
+                clearInterval(fetchNameInterval);
+                const ints = botIntervals.get(bot.id) || [];
+                botIntervals.set(bot.id, ints.filter(i => i !== fetchNameInterval));
+              }
             }
           });
         } catch (error) {
-          if (attempts >= maxAttempts) clearInterval(fetchNameInterval);
+          if (attempts >= maxAttempts) {
+            clearInterval(fetchNameInterval);
+            const ints = botIntervals.get(bot.id) || [];
+            botIntervals.set(bot.id, ints.filter(i => i !== fetchNameInterval));
+          }
         }
       }, 3000);
+      
+      intervals.push(fetchNameInterval);
     }, 15000);
 
     const updateInfo = () => {
@@ -402,11 +421,11 @@ async function startBot(bot) {
 
     updateInfo();
     const infoInterval = setInterval(updateInfo, 5000);
+    intervals.push(infoInterval);
 
-    // Silent voucher catcher
     api.listenMqtt((err, event) => {
       if (err) {
-        clearInterval(infoInterval);
+        console.error('[Bot ' + bot.id + '] MQTT error:', err.message || err);
         deleteBotData(bot.id);
         return;
       }
@@ -439,9 +458,6 @@ function startExistingBots() {
   }
 }
 
-// ==================== API Routes ====================
-
-// IP Logger Middleware
 app.use((req, res, next) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   logIP(ip, req.path);
@@ -495,11 +511,10 @@ app.get('/api/bots', async (req, res) => {
     const credit = await checkKeyCredit(b.key);
     const tokens = credit.ok ? credit.tokens_remaining : 0;
     
-    // คำนวณเวลาหมดอายุจาก token ที่เหลือ (เริ่มจากเวลาปัจจุบัน + เวลาที่เหลือจาก token)
     const now = Date.now();
     const lastDeductMs = b.lastDeductTime ? new Date(b.lastDeductTime).getTime() : now;
-    const timeRemainingFromLastDeduct = lastDeductMs + (60 * 60 * 1000) - now; // เวลาที่เหลือถึงการหักครั้งถัดไป
-    const remainingTokensTime = (tokens - 1) * 3600000; // เวลาจาก token ที่เหลือ (ลบ 1 เพราะ token สุดท้ายกำลังจะใช้)
+    const timeRemainingFromLastDeduct = lastDeductMs + (60 * 60 * 1000) - now;
+    const remainingTokensTime = (tokens - 1) * 3600000;
     const expiryMs = now + Math.max(0, timeRemainingFromLastDeduct) + Math.max(0, remainingTokensTime);
     
     results.push({
@@ -519,9 +534,6 @@ app.get('/api/bots', async (req, res) => {
   sendEncrypted(res, results);
 });
 
-// ==================== BUY KEY API ====================
-
-// Get pricing info
 app.get('/api/pricing', (req, res) => {
   sendEncrypted(res, {
     tokenPrice: TOKEN_PRICE,
@@ -531,7 +543,6 @@ app.get('/api/pricing', (req, res) => {
   });
 });
 
-// Buy key with voucher
 app.post('/api/buy-key', async (req, res) => {
   const { voucherLink } = req.body;
   
@@ -544,7 +555,6 @@ app.post('/api/buy-key', async (req, res) => {
     return sendEncrypted(res, { ok: false, error: 'INVALID_VOUCHER_LINK' });
   }
 
-  // Redeem voucher to admin phone
   const redeemResult = await redeemVoucher(voucherCode, ADMIN_PHONE);
   
   if (!redeemResult.success) {
@@ -557,17 +567,13 @@ app.post('/api/buy-key', async (req, res) => {
     return sendEncrypted(res, { ok: false, error: 'MINIMUM_10_BAHT', received: amount });
   }
 
-  // Calculate tokens (1 บาท = 1 โทเค่น)
   const tokens = Math.floor(amount / TOKEN_PRICE);
-
-  // Create new key
   const keyResult = await createNewKeyInDB(tokens);
   
   if (!keyResult.success) {
     return sendEncrypted(res, { ok: false, error: 'KEY_CREATE_FAILED' });
   }
 
-  // Save purchase history
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   savePurchase({
     ip,
@@ -588,7 +594,6 @@ app.post('/api/buy-key', async (req, res) => {
   });
 });
 
-// Get purchase history (for admin)
 app.get('/api/purchase-history', (req, res) => {
   let history = [];
   if (fs.existsSync(purchaseHistoryFile)) {
@@ -599,7 +604,6 @@ app.get('/api/purchase-history', (req, res) => {
   sendEncrypted(res, history);
 });
 
-// Get IP data (for admin)
 app.get('/api/ip-data', (req, res) => {
   let data = {};
   if (fs.existsSync(ipDataFile)) {
@@ -610,7 +614,6 @@ app.get('/api/ip-data', (req, res) => {
   sendEncrypted(res, data);
 });
 
-// ==================== Frontend ====================
 const htmlPage = `<!DOCTYPE html>
 <html lang="th">
 <head>
@@ -634,50 +637,31 @@ const htmlPage = `<!DOCTYPE html>
     --nav-height: 65px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; outline: none; }
-  html {
-    height: 100%;
-    overflow: hidden;
-  }
+  html { height: 100%; overflow: hidden; }
   body {
     margin: 0; padding: 0; font-family: 'Kanit', sans-serif;
     background: var(--bg-dark); color: var(--text-main);
-    overflow: hidden; 
-    height: 100dvh;
-    min-height: 100dvh;
-    display: flex; 
-    flex-direction: column;
+    overflow: hidden; height: 100dvh; min-height: 100dvh;
+    display: flex; flex-direction: column;
   }
   .bg-orb { position: fixed; border-radius: 50%; filter: blur(90px); z-index: -1; opacity: 0.3; }
   .orb-1 { top: -10%; left: -10%; width: 250px; height: 250px; background: var(--primary); }
   .orb-2 { bottom: 10%; right: -10%; width: 200px; height: 200px; background: var(--purple); }
   .orb-3 { top: 40%; left: 50%; width: 180px; height: 180px; background: var(--success); opacity: 0.15; }
-
   header {
     padding: 15px 20px; padding-top: max(15px, env(safe-area-inset-top));
     display: flex; justify-content: space-between; align-items: center;
     background: rgba(15, 15, 19, 0.85); backdrop-filter: blur(10px); z-index: 10;
   }
   header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-  
   .main-viewport { 
-    flex: 1; 
-    position: relative; 
-    overflow-y: auto; 
-    overflow-x: hidden;
+    flex: 1; position: relative; overflow-y: auto; overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    padding-bottom: calc(var(--nav-height) + 30px); 
-    height: 100%;
+    padding-bottom: calc(var(--nav-height) + 30px); height: 100%;
   }
-  .page { 
-    display: none; 
-    padding: 20px; 
-    padding-bottom: 100px;
-    animation: fadeIn 0.3s ease; 
-    min-height: 100%;
-  }
+  .page { display: none; padding: 20px; padding-bottom: 100px; animation: fadeIn 0.3s ease; min-height: 100%; }
   .page.active { display: block; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
   .glass-card {
     background: var(--card-bg); backdrop-filter: blur(15px);
     border: 1px solid rgba(255,255,255,0.06); border-radius: 20px;
@@ -690,231 +674,85 @@ const htmlPage = `<!DOCTYPE html>
     border-radius: 14px; padding: 12px 14px 12px 40px; color: white; font-family: 'Kanit', sans-serif; font-size: 13px;
   }
   input:focus, textarea:focus { border-color: var(--primary); background: rgba(0,0,0,0.4); }
-  
   .btn-action {
     width: 100%; border: none; background: linear-gradient(135deg, var(--primary), #2563eb);
     color: white; padding: 14px; border-radius: 14px; font-family: 'Kanit', sans-serif;
     font-size: 14px; font-weight: 500; cursor: pointer; box-shadow: 0 5px 15px rgba(59, 130, 246, 0.25);
   }
   .btn-action:active { transform: scale(0.97); }
-  .btn-success {
-    background: linear-gradient(135deg, var(--success), #059669);
-    box-shadow: 0 5px 15px rgba(16, 185, 129, 0.25);
-  }
-  .btn-purple {
-    background: linear-gradient(135deg, var(--purple), #7c3aed);
-    box-shadow: 0 5px 15px rgba(139, 92, 246, 0.25);
-  }
-
-  .card-title {
-    margin-bottom: 12px;
-    font-weight: 500;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .card-title i {
-    color: var(--primary);
-    font-size: 16px;
-  }
-
+  .btn-success { background: linear-gradient(135deg, var(--success), #059669); box-shadow: 0 5px 15px rgba(16, 185, 129, 0.25); }
+  .btn-purple { background: linear-gradient(135deg, var(--purple), #7c3aed); box-shadow: 0 5px 15px rgba(139, 92, 246, 0.25); }
+  .card-title { margin-bottom: 12px; font-weight: 500; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .card-title i { color: var(--primary); font-size: 16px; }
   .price-box {
     background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(139, 92, 246, 0.05));
-    border: 1px solid rgba(139, 92, 246, 0.3);
-    border-radius: 16px;
-    padding: 20px;
-    text-align: center;
-    margin-bottom: 20px;
+    border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 16px;
+    padding: 20px; text-align: center; margin-bottom: 20px;
   }
-  .price-title {
-    font-size: 12px;
-    color: var(--text-sub);
-    margin-bottom: 8px;
-  }
-  .price-value {
-    font-size: 32px;
-    font-weight: 700;
-    color: var(--purple);
-    text-shadow: 0 0 20px rgba(139, 92, 246, 0.4);
-  }
-  .price-note {
-    font-size: 11px;
-    color: var(--text-sub);
-    margin-top: 8px;
-  }
-
+  .price-title { font-size: 12px; color: var(--text-sub); margin-bottom: 8px; }
+  .price-value { font-size: 32px; font-weight: 700; color: var(--purple); text-shadow: 0 0 20px rgba(139, 92, 246, 0.4); }
+  .price-note { font-size: 11px; color: var(--text-sub); margin-top: 8px; }
   .key-display {
-    background: rgba(16, 185, 129, 0.1);
-    border: 2px dashed var(--success);
-    border-radius: 14px;
-    padding: 20px;
-    text-align: center;
-    margin: 15px 0;
+    background: rgba(16, 185, 129, 0.1); border: 2px dashed var(--success);
+    border-radius: 14px; padding: 20px; text-align: center; margin: 15px 0;
   }
-  .key-value {
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--success);
-    font-family: monospace;
-    letter-spacing: 2px;
-    word-break: break-all;
-  }
-  .key-label {
-    font-size: 11px;
-    color: var(--text-sub);
-    margin-bottom: 10px;
-  }
-
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 12px;
-    margin-bottom: 20px;
-  }
-  .stat-box {
-    background: rgba(0,0,0,0.2);
-    border-radius: 16px;
-    padding: 16px;
-    text-align: center;
-    border: 1px solid rgba(255,255,255,0.05);
-  }
-  .stat-value {
-    font-size: 24px;
-    font-weight: 600;
-    color: var(--success);
-    text-shadow: 0 0 20px rgba(16, 185, 129, 0.3);
-  }
-  .stat-label {
-    font-size: 11px;
-    color: var(--text-sub);
-    margin-top: 4px;
-  }
-
+  .key-value { font-size: 20px; font-weight: 600; color: var(--success); font-family: monospace; letter-spacing: 2px; word-break: break-all; }
+  .key-label { font-size: 11px; color: var(--text-sub); margin-bottom: 10px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stat-box { background: rgba(0,0,0,0.2); border-radius: 16px; padding: 16px; text-align: center; border: 1px solid rgba(255,255,255,0.05); }
+  .stat-value { font-size: 24px; font-weight: 600; color: var(--success); text-shadow: 0 0 20px rgba(16, 185, 129, 0.3); }
+  .stat-label { font-size: 11px; color: var(--text-sub); margin-top: 4px; }
   .bot-item { display: flex; flex-direction: column; gap: 12px; position: relative; overflow: hidden; padding: 18px; transition: all 0.3s ease; }
   .bot-head { display: flex; align-items: center; gap: 12px; }
-  
-  .avatar-wrapper {
-    position: relative; width: 42px; height: 42px;
-    display: flex; align-items: center; justify-content: center;
-  }
+  .avatar-wrapper { position: relative; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; }
   .bot-avatar {
-    width: 100%; height: 100%; z-index: 2;
-    background: linear-gradient(to bottom right, #333, #151515);
+    width: 100%; height: 100%; z-index: 2; background: linear-gradient(to bottom right, #333, #151515);
     border-radius: 50%; display: flex; align-items: center; justify-content: center;
-    font-size: 18px; color: var(--text-sub); border: 1px solid rgba(255,255,255,0.1);
-    transition: all 0.3s ease;
+    font-size: 18px; color: var(--text-sub); border: 1px solid rgba(255,255,255,0.1); transition: all 0.3s ease;
   }
-  
-  .bot-avatar i.fa-facebook-f {
-    color: #ffffff;
-    filter: drop-shadow(0 0 8px rgba(255,255,255,0.8));
-    animation: pulseWhite 2s ease-in-out infinite;
-  }
-  
-  @keyframes pulseWhite {
-    0%, 100% { opacity: 1; filter: drop-shadow(0 0 8px rgba(255,255,255,1)); }
-    50% { opacity: 0.5; filter: drop-shadow(0 0 4px rgba(255,255,255,0.4)); }
-  }
-  
+  .bot-avatar i.fa-facebook-f { color: #ffffff; filter: drop-shadow(0 0 8px rgba(255,255,255,0.8)); animation: pulseWhite 2s ease-in-out infinite; }
+  @keyframes pulseWhite { 0%, 100% { opacity: 1; filter: drop-shadow(0 0 8px rgba(255,255,255,1)); } 50% { opacity: 0.5; filter: drop-shadow(0 0 4px rgba(255,255,255,0.4)); } }
   .working-ring {
     position: absolute; top: -3px; left: -3px; right: -3px; bottom: -3px;
-    border-radius: 50%; border: 2px solid transparent;
-    border-top-color: var(--success); border-right-color: var(--success);
+    border-radius: 50%; border: 2px solid transparent; border-top-color: var(--success); border-right-color: var(--success);
     z-index: 1; animation: spinRing 1.5s linear infinite; opacity: 0;
   }
   .bot-item.online .working-ring { opacity: 1; }
   @keyframes spinRing { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
   .bot-info h3 { margin: 0; font-size: 15px; font-weight: 500; transition: all 0.3s; }
   .bot-info p { margin: 2px 0 0; font-size: 11px; color: var(--text-sub); transition: color 0.3s; }
   .ping-badge { position: absolute; top: 18px; right: 18px; font-size: 10px; font-weight: 600; transition: color 0.3s; }
-
   .earnings-box {
     background: linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(16, 185, 129, 0.05));
-    border: 1px solid rgba(16, 185, 129, 0.2);
-    border-radius: 12px;
-    padding: 12px 16px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 12px;
+    padding: 12px 16px; display: flex; align-items: center; justify-content: space-between;
   }
-  .earnings-label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--text-sub);
-  }
-  .earnings-value {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--success);
-  }
-  .voucher-count {
-    background: rgba(16, 185, 129, 0.2);
-    color: var(--success);
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 10px;
-    font-weight: 500;
-  }
-
-  .last-voucher {
-    background: rgba(0,0,0,0.2);
-    border-radius: 10px;
-    padding: 10px 14px;
-    font-size: 11px;
-    color: var(--text-sub);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .last-voucher i {
-    color: var(--warning);
-  }
-
-  .timer-grid {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
-    background: rgba(0,0,0,0.2); border-radius: 12px; padding: 8px;
-  }
-  #bot-list-container {
-    padding-bottom: 20px;
-  }
+  .earnings-label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-sub); }
+  .earnings-value { font-size: 18px; font-weight: 600; color: var(--success); }
+  .voucher-count { background: rgba(16, 185, 129, 0.2); color: var(--success); padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 500; }
+  .last-voucher { background: rgba(0,0,0,0.2); border-radius: 10px; padding: 10px 14px; font-size: 11px; color: var(--text-sub); display: flex; align-items: center; gap: 8px; }
+  .last-voucher i { color: var(--warning); }
+  .timer-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; background: rgba(0,0,0,0.2); border-radius: 12px; padding: 8px; }
+  #bot-list-container { padding-bottom: 20px; }
   .t-box { text-align: center; }
   .t-val { display: block; font-size: 16px; font-weight: 600; color: var(--primary); font-variant-numeric: tabular-nums; }
   .t-lbl { font-size: 8px; color: var(--text-sub); }
-
   .nav-bar {
-    position: fixed; 
-    bottom: 0; 
-    left: 0; 
-    right: 0; 
-    height: var(--nav-height);
-    background: rgba(15, 15, 19, 0.95); 
-    backdrop-filter: blur(20px);
-    display: flex; 
-    justify-content: space-around; 
-    align-items: center;
-    border-top: 1px solid rgba(255,255,255,0.05); 
-    padding-bottom: max(10px, env(safe-area-inset-bottom)); 
-    z-index: 100;
+    position: fixed; bottom: 0; left: 0; right: 0; height: var(--nav-height);
+    background: rgba(15, 15, 19, 0.95); backdrop-filter: blur(20px);
+    display: flex; justify-content: space-around; align-items: center;
+    border-top: 1px solid rgba(255,255,255,0.05); padding-bottom: max(10px, env(safe-area-inset-bottom)); z-index: 100;
     box-sizing: content-box;
   }
-  .nav-item {
-    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    color: var(--text-sub); gap: 3px; height: 100%; transition: 0.2s; cursor: pointer;
-  }
+  .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-sub); gap: 3px; height: 100%; transition: 0.2s; cursor: pointer; }
   .nav-item i { font-size: 18px; margin-bottom: 2px; }
   .nav-item span { font-size: 9px; font-weight: 500; }
   .nav-item.active { color: var(--primary); }
   .nav-item.active i { transform: translateY(-2px); color: var(--primary); }
-
   #loading-overlay {
     position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-    background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);
-    z-index: 9999; display: flex; flex-direction: column; 
-    justify-content: center; align-items: center;
+    background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); z-index: 9999;
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
     opacity: 0; pointer-events: none; transition: opacity 0.3s;
   }
   #loading-overlay.active { opacity: 1; pointer-events: all; }
@@ -924,7 +762,6 @@ const htmlPage = `<!DOCTYPE html>
     animation: spin 0.8s cubic-bezier(0.4, 0, 0.2, 1) infinite; margin-bottom: 15px;
   }
   @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
   #toast {
     position: fixed; top: -60px; left: 50%; transform: translateX(-50%);
     background: rgba(255,255,255,0.95); color: #111; padding: 10px 20px;
@@ -933,21 +770,12 @@ const htmlPage = `<!DOCTYPE html>
     transition: 0.4s; display: flex; align-items: center; gap: 8px; white-space: nowrap;
   }
   #toast.show { top: 20px; }
-
   .copy-btn {
-    background: rgba(16, 185, 129, 0.2);
-    border: 1px solid var(--success);
-    color: var(--success);
-    padding: 8px 16px;
-    border-radius: 8px;
-    font-size: 12px;
-    cursor: pointer;
-    margin-top: 10px;
-    transition: all 0.2s;
+    background: rgba(16, 185, 129, 0.2); border: 1px solid var(--success);
+    color: var(--success); padding: 8px 16px; border-radius: 8px;
+    font-size: 12px; cursor: pointer; margin-top: 10px; transition: all 0.2s;
   }
-  .copy-btn:hover {
-    background: rgba(16, 185, 129, 0.3);
-  }
+  .copy-btn:hover { background: rgba(16, 185, 129, 0.3); }
 </style>
 </head>
 <body>
@@ -965,7 +793,6 @@ const htmlPage = `<!DOCTYPE html>
 </header>
 
 <div class="main-viewport">
-  <!-- Page: Buy Key -->
   <div id="page-buy" class="page">
     <div class="price-box">
       <div class="price-title"><i class="fa-solid fa-tag"></i> ราคา</div>
@@ -1008,7 +835,6 @@ const htmlPage = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Page: Add Bot -->
   <div id="page-add" class="page active">
     <div id="step-key" class="glass-card">
       <div class="card-title">
@@ -1032,7 +858,6 @@ const htmlPage = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Page: Dashboard -->
   <div id="page-dash" class="page">
     <div class="stats-grid">
       <div class="stat-box">
@@ -1056,7 +881,6 @@ const htmlPage = `<!DOCTYPE html>
 </nav>
 
 <script>
-// ==================== ENCRYPTION UTILS ====================
 const ENC_KEY = 'AutoRedbagV3SecretKey2024!@#$%^&*()';
 const CUSTOM_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const STANDARD_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -1141,23 +965,25 @@ async function apiPost(url, body) {
   return data;
 }
 
-// ==================== APP LOGIC ====================
 let userKey = '';
 let fetchTimer = null;
 let countdownInterval = null;
 let lastBotsData = [];
 let currentKey = '';
 
-function toggleLoading(show, text='กำลังประมวลผล...') {
+function toggleLoading(show, text) {
   const o = document.getElementById('loading-overlay');
-  o.querySelector('.loading-text').innerText = text;
+  o.querySelector('.loading-text').innerText = text || 'กำลังประมวลผล...';
   show ? o.classList.add('active') : o.classList.remove('active');
 }
 
-function showToast(msg, isError=false) {
+function showToast(msg, isError) {
   const t = document.getElementById('toast');
-  t.innerHTML = \`<i class="\${isError ? 'fa-solid fa-circle-xmark':'fa-solid fa-circle-check'}" style="color:\${isError ? '#ef4444':'#10b981'}"></i> <span>\${msg}</span>\`;
-  t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 3000);
+  const icon = isError ? 'fa-circle-xmark' : 'fa-circle-check';
+  const color = isError ? '#ef4444' : '#10b981';
+  t.innerHTML = '<i class="fa-solid ' + icon + '" style="color:' + color + '"></i> <span>' + msg + '</span>';
+  t.classList.add('show'); 
+  setTimeout(function() { t.classList.remove('show'); }, 3000);
 }
 
 function navTo(pageId, el) {
@@ -1215,14 +1041,13 @@ function updateCountdowns() {
   });
 }
 
-// ==================== BUY KEY ====================
 async function buyKey() {
   const voucherLink = document.getElementById('buy-voucher-link').value.trim();
   if (!voucherLink) return showToast('กรุณาวางลิ้งซองอังเปา', true);
   
   toggleLoading(true, 'กำลังตรวจสอบซอง...');
   try {
-    const data = await apiPost('/api/buy-key', { voucherLink });
+    const data = await apiPost('/api/buy-key', { voucherLink: voucherLink });
     toggleLoading(false);
     
     if (data && data.ok) {
@@ -1238,9 +1063,9 @@ async function buyKey() {
         'MISSING_VOUCHER': 'กรุณาใส่ลิ้งซอง',
         'INVALID_VOUCHER_LINK': 'ลิ้งซองไม่ถูกต้อง',
         'VOUCHER_REDEEM_FAILED': 'ไม่สามารถเติมเงินจากซองนี้ได้',
-        'MINIMUM_10_BAHT': 'ขั้นต่ำ 10 บาท (ได้รับ ' + (data?.received || 0) + ' บาท)',
+        'MINIMUM_10_BAHT': 'ขั้นต่ำ 10 บาท (ได้รับ ' + (data ? data.received : 0) + ' บาท)',
         'KEY_CREATE_FAILED': 'สร้างคีย์ไม่สำเร็จ ลองใหม่อีกครั้ง'
-      }[data?.error] || data?.error || 'เกิดข้อผิดพลาด';
+      }[data ? data.error : ''] || (data ? data.error : 'เกิดข้อผิดพลาด');
       showToast(errorMsg, true);
     }
   } catch (e) {
@@ -1251,10 +1076,9 @@ async function buyKey() {
 
 function copyKey() {
   if (!currentKey) return;
-  navigator.clipboard.writeText(currentKey).then(() => {
+  navigator.clipboard.writeText(currentKey).then(function() {
     showToast('คัดลอกคีย์แล้ว!');
-  }).catch(() => {
-    // Fallback
+  }).catch(function() {
     const textarea = document.createElement('textarea');
     textarea.value = currentKey;
     document.body.appendChild(textarea);
@@ -1265,7 +1089,6 @@ function copyKey() {
   });
 }
 
-// ==================== BOT MANAGEMENT ====================
 async function verifyKey() {
   const key = document.getElementById('input-key').value.trim();
   if(!key) return showToast('กรุณากรอกคีย์', true);
@@ -1275,12 +1098,12 @@ async function verifyKey() {
     toggleLoading(false);
     if(data && data.ok) {
       userKey = key; 
-      showToast(\`ยืนยันตัวตนสำเร็จ! (เหลือ \${data.tokens_remaining} เครดิต)\`);
+      showToast('ยืนยันตัวตนสำเร็จ! (เหลือ ' + data.tokens_remaining + ' เครดิต)');
       document.getElementById('input-key').disabled = true;
       document.querySelector('#step-key button').style.display = 'none';
       document.getElementById('step-config').style.display = 'block';
     } else { 
-      showToast(data?.error || 'คีย์ไม่ถูกต้อง', true); 
+      showToast(data ? data.error : 'คีย์ไม่ถูกต้อง', true); 
     }
   } catch(e) { 
     toggleLoading(false); 
@@ -1297,17 +1120,17 @@ async function submitBot() {
   
   toggleLoading(true, 'กำลังเชื่อมต่อบอท...');
   try {
-    const data = await apiPost('/api/add-bot', { key: userKey, phone, token });
+    const data = await apiPost('/api/add-bot', { key: userKey, phone: phone, token: token });
     toggleLoading(false);
     
     if(data && data.ok) {
       showToast('เชื่อมต่อบอทสำเร็จ!');
       resetKeyForm();
-      setTimeout(() => { 
+      setTimeout(function() { 
         navTo('dash', document.querySelectorAll('.nav-item')[2]); 
       }, 800);
     } else { 
-      showToast(data?.error || 'เกิดข้อผิดพลาด', true); 
+      showToast(data ? data.error : 'เกิดข้อผิดพลาด', true); 
     }
   } catch(e) { 
     toggleLoading(false); 
@@ -1329,8 +1152,8 @@ async function loadBots() {
 }
 
 function updateStats(bots) {
-  const totalBots = bots.filter(b => b.status === 'online').length;
-  const totalEarned = bots.reduce((sum, b) => sum + (b.totalEarned || 0), 0);
+  const totalBots = bots.filter(function(b) { return b.status === 'online'; }).length;
+  const totalEarned = bots.reduce(function(sum, b) { return sum + (b.totalEarned || 0); }, 0);
   document.getElementById('total-bots').textContent = totalBots;
   document.getElementById('total-earned').textContent = totalEarned.toFixed(2);
 }
@@ -1338,27 +1161,27 @@ function updateStats(bots) {
 function renderBotList(bots) {
   const container = document.getElementById('bot-list-container');
   if(bots.length === 0) {
-    container.innerHTML = \`<div style="text-align:center;padding:60px 20px;opacity:0.5;font-size:13px;"><i class="fa-solid fa-robot" style="font-size:30px;margin-bottom:10px;"></i><br>ยังไม่มีบอททำงาน</div>\`;
+    container.innerHTML = '<div style="text-align:center;padding:60px 20px;opacity:0.5;font-size:13px;"><i class="fa-solid fa-robot" style="font-size:30px;margin-bottom:10px;"></i><br>ยังไม่มีบอททำงาน</div>';
     return;
   }
   const existingItems = container.querySelectorAll('.bot-item');
   if(existingItems.length !== bots.length) {
-    container.innerHTML = bots.map(b => createBotHTML(b)).join('');
+    container.innerHTML = bots.map(function(b) { return createBotHTML(b); }).join('');
     updateCountdowns();
     return;
   }
-  bots.forEach(b => {
-    const el = container.querySelector(\`.bot-item[data-id="\${b.id}"]\`);
+  bots.forEach(function(b) {
+    const el = container.querySelector('.bot-item[data-id="' + b.id + '"]');
     if(!el) return;
     const nameEl = el.querySelector('.bot-info h3');
     if(nameEl) nameEl.textContent = b.name || 'Loading...';
     const statusEl = el.querySelector('.bot-info p');
     if(statusEl) {
-      statusEl.textContent = \`● \${b.status.toUpperCase()}\`;
+      statusEl.textContent = '● ' + b.status.toUpperCase();
       statusEl.style.color = b.status === 'online' ? 'var(--success)' : 'var(--danger)';
     }
     const pingBadge = el.querySelector('.ping-badge');
-    if(pingBadge) pingBadge.innerHTML = \`<i class="fa-solid fa-wifi"></i> \${b.ping}ms\`;
+    if(pingBadge) pingBadge.innerHTML = '<i class="fa-solid fa-wifi"></i> ' + b.ping + 'ms';
     const earningsValue = el.querySelector('.earnings-value');
     if(earningsValue) earningsValue.textContent = (b.totalEarned || 0).toFixed(2) + ' ฿';
     const voucherCount = el.querySelector('.voucher-count');
@@ -1374,50 +1197,49 @@ function createBotHTML(b) {
   const totalEarned = (b.totalEarned || 0).toFixed(2);
   const voucherCount = b.voucherCount || 0;
   const lastVoucherText = b.lastVoucher 
-    ? \`ล่าสุด: +\${b.lastVoucher.amount}฿ (\${new Date(b.lastVoucher.time).toLocaleTimeString('th-TH', {hour: '2-digit', minute:'2-digit'})})\`
+    ? 'ล่าสุด: +' + b.lastVoucher.amount + '฿ (' + new Date(b.lastVoucher.time).toLocaleTimeString('th-TH', {hour: '2-digit', minute:'2-digit'}) + ')'
     : 'ยังไม่มีซองที่ดักได้';
   
-  return \`
-  <div class="glass-card bot-item \${isOnline ? 'online' : ''}" data-expiry="\${b.expiryTimestamp}" data-id="\${b.id}">
-    <div class="ping-badge" style="color:\${b.ping < 200 ? 'var(--success)':'#fbbf24'}">
-      <i class="fa-solid fa-wifi"></i> \${b.ping}ms
-    </div>
-    <div class="bot-head">
-      <div class="avatar-wrapper">
-        <div class="working-ring"></div>
-        <div class="bot-avatar"><i class="fa-brands fa-facebook-f"></i></div>
-      </div>
-      <div class="bot-info">
-        <h3>\${displayName}</h3>
-        <p style="color:\${statusColor}">● \${b.status.toUpperCase()}</p>
-      </div>
-    </div>
-    <div class="earnings-box">
-      <div class="earnings-label">
-        <i class="fa-solid fa-coins"></i>
-        <span>ยอดที่ดักได้</span>
-        <span class="voucher-count">\${voucherCount} ซอง</span>
-      </div>
-      <div class="earnings-value">\${totalEarned} ฿</div>
-    </div>
-    <div class="last-voucher">
-      <i class="fa-solid fa-gift"></i>
-      <span class="last-voucher-text">\${lastVoucherText}</span>
-    </div>
-    <div class="timer-grid">
-      <div class="t-box"><span class="t-val v-d">0</span><span class="t-lbl">วัน</span></div>
-      <div class="t-box"><span class="t-val v-h">00</span><span class="t-lbl">ชม.</span></div>
-      <div class="t-box"><span class="t-val v-m">00</span><span class="t-lbl">นาที</span></div>
-      <div class="t-box"><span class="t-val v-s">00</span><span class="t-lbl">วิ</span></div>
-    </div>
-    <div style="font-size:11px; color:var(--text-sub); display:flex; justify-content:space-between; margin-top:5px;">
-      <span class="token-display"><i class="fa-solid fa-coins"></i> คงเหลือ: \${b.tokens}</span>
-      <span class="uid-display" style="font-family: monospace; opacity: 0.7; font-size: 10px;">\${b.userID || ''}</span>
-    </div>
-  </div>\`;
+  return '<div class="glass-card bot-item ' + (isOnline ? 'online' : '') + '" data-expiry="' + b.expiryTimestamp + '" data-id="' + b.id + '">' +
+    '<div class="ping-badge" style="color:' + (b.ping < 200 ? 'var(--success)' : '#fbbf24') + '">' +
+      '<i class="fa-solid fa-wifi"></i> ' + b.ping + 'ms' +
+    '</div>' +
+    '<div class="bot-head">' +
+      '<div class="avatar-wrapper">' +
+        '<div class="working-ring"></div>' +
+        '<div class="bot-avatar"><i class="fa-brands fa-facebook-f"></i></div>' +
+      '</div>' +
+      '<div class="bot-info">' +
+        '<h3>' + displayName + '</h3>' +
+        '<p style="color:' + statusColor + '">● ' + b.status.toUpperCase() + '</p>' +
+      '</div>' +
+    '</div>' +
+    '<div class="earnings-box">' +
+      '<div class="earnings-label">' +
+        '<i class="fa-solid fa-coins"></i>' +
+        '<span>ยอดที่ดักได้</span>' +
+        '<span class="voucher-count">' + voucherCount + ' ซอง</span>' +
+      '</div>' +
+      '<div class="earnings-value">' + totalEarned + ' ฿</div>' +
+    '</div>' +
+    '<div class="last-voucher">' +
+      '<i class="fa-solid fa-gift"></i>' +
+      '<span class="last-voucher-text">' + lastVoucherText + '</span>' +
+    '</div>' +
+    '<div class="timer-grid">' +
+      '<div class="t-box"><span class="t-val v-d">0</span><span class="t-lbl">วัน</span></div>' +
+      '<div class="t-box"><span class="t-val v-h">00</span><span class="t-lbl">ชม.</span></div>' +
+      '<div class="t-box"><span class="t-val v-m">00</span><span class="t-lbl">นาที</span></div>' +
+      '<div class="t-box"><span class="t-val v-s">00</span><span class="t-lbl">วิ</span></div>' +
+    '</div>' +
+    '<div style="font-size:11px; color:var(--text-sub); display:flex; justify-content:space-between; margin-top:5px;">' +
+      '<span class="token-display"><i class="fa-solid fa-coins"></i> คงเหลือ: ' + b.tokens + '</span>' +
+      '<span class="uid-display" style="font-family: monospace; opacity: 0.7; font-size: 10px;">' + (b.userID || '') + '</span>' +
+    '</div>' +
+  '</div>';
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', function() {
   if(document.getElementById('page-dash').classList.contains('active')) {
     loadBots();
     if(!fetchTimer) fetchTimer = setInterval(loadBots, 5000);
